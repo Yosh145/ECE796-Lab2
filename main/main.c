@@ -1,5 +1,6 @@
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lsm6dsv16x_reg.h"
@@ -204,5 +205,118 @@ void app_main(void) {
     return;
   }
 
-  ESP_LOGI(TAG, "System ready. Waiting for next milestone...");
+  // ========== MILESTONE 2: Configure Sensor for 120 Hz HAODR Mode ==========
+  ESP_LOGI(TAG, "");
+  ESP_LOGI(TAG, "Starting Milestone 2: Basic Sensor Reading");
+
+  // Wait for device to be ready
+  vTaskDelay(pdMS_TO_TICKS(10));
+
+  // Configure accelerometer: 120 Hz HAODR, ±4g, high-performance mode
+  err = lsm6dsv16x_xl_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set accelerometer ODR (error: %ld)", err);
+    return;
+  }
+
+  err = lsm6dsv16x_xl_full_scale_set(&dev_ctx, LSM6DSV16X_4g);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set accelerometer full-scale (error: %ld)", err);
+    return;
+  }
+
+  err = lsm6dsv16x_xl_mode_set(&dev_ctx, LSM6DSV16X_XL_HIGH_PERFORMANCE_MD);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set accelerometer mode (error: %ld)", err);
+    return;
+  }
+
+  ESP_LOGI(TAG,
+           "Accelerometer configured: 120 Hz HAODR, ±4g, high-performance");
+
+  // Configure gyroscope: 120 Hz HAODR, ±2000 dps, high-performance mode
+  err = lsm6dsv16x_gy_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set gyroscope ODR (error: %ld)", err);
+    return;
+  }
+
+  err = lsm6dsv16x_gy_full_scale_set(&dev_ctx, LSM6DSV16X_2000dps);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set gyroscope full-scale (error: %ld)", err);
+    return;
+  }
+
+  err = lsm6dsv16x_gy_mode_set(&dev_ctx, LSM6DSV16X_GY_HIGH_PERFORMANCE_MD);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set gyroscope mode (error: %ld)", err);
+    return;
+  }
+
+  ESP_LOGI(TAG,
+           "Gyroscope configured: 120 Hz HAODR, ±2000 dps, high-performance");
+  ESP_LOGI(TAG, "");
+  ESP_LOGI(TAG, "Starting data acquisition (Ctrl+] to stop)...");
+  ESP_LOGI(TAG, "Format: [Sample] Timestamp(us) | Accel(mg): X, Y, Z | "
+                "Gyro(mdps): X, Y, Z");
+  ESP_LOGI(TAG, "");
+
+  // Data acquisition loop
+  uint32_t sample_count = 0;
+  lsm6dsv16x_all_sources_t status;
+  int16_t accel_raw[3];
+  int16_t gyro_raw[3];
+  float accel_mg[3];
+  float gyro_mdps[3];
+
+  while (1) {
+    // Check if data is ready
+    err = lsm6dsv16x_all_sources_get(&dev_ctx, &status);
+    if (err != 0) {
+      ESP_LOGW(TAG, "Failed to read status (error: %ld)", err);
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Wait for both accelerometer and gyroscope data to be ready
+    if (status.drdy_xl && status.drdy_gy) {
+      // Capture timestamp as soon as data is ready
+      int64_t timestamp_us = esp_timer_get_time();
+
+      // Read accelerometer data
+      err = lsm6dsv16x_acceleration_raw_get(&dev_ctx, accel_raw);
+      if (err != 0) {
+        ESP_LOGW(TAG, "Failed to read accelerometer (error: %ld)", err);
+        continue;
+      }
+
+      // Read gyroscope data
+      err = lsm6dsv16x_angular_rate_raw_get(&dev_ctx, gyro_raw);
+      if (err != 0) {
+        ESP_LOGW(TAG, "Failed to read gyroscope (error: %ld)", err);
+        continue;
+      }
+
+      // Convert raw data to physical units
+      accel_mg[0] = lsm6dsv16x_from_fs4_to_mg(accel_raw[0]);
+      accel_mg[1] = lsm6dsv16x_from_fs4_to_mg(accel_raw[1]);
+      accel_mg[2] = lsm6dsv16x_from_fs4_to_mg(accel_raw[2]);
+
+      gyro_mdps[0] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[0]);
+      gyro_mdps[1] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[1]);
+      gyro_mdps[2] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[2]);
+
+      // Print formatted data
+      printf("[%5lu] %lld | Accel: %7.2f, %7.2f, %7.2f | Gyro: %8.2f, %8.2f, "
+             "%8.2f\n",
+             sample_count, timestamp_us, accel_mg[0], accel_mg[1], accel_mg[2],
+             gyro_mdps[0], gyro_mdps[1], gyro_mdps[2]);
+
+      sample_count++;
+    }
+
+    // Small delay to prevent CPU hogging (data ready at ~120 Hz = ~8.3 ms
+    // period)
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 }
