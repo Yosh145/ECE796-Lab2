@@ -1,3 +1,4 @@
+#include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -20,8 +21,44 @@
 // LSM6DSV16X Configuration
 #define LSM6DSV16X_I2C_ADDR 0x6B     // SA0 pulled high
 #define LSM6DSV16X_WHO_AM_I_VAL 0x70 // Expected WHO_AM_I value
+#define LSM6DSV16X_INT1_GPIO 5       // GPIO5 for INT1 interrupt
 
 static const char *TAG = "LSM6DSV16X";
+
+// Global variables for interrupt handling
+static TaskHandle_t data_task_handle = NULL;
+static volatile int64_t interrupt_timestamp_us = 0;
+static volatile uint32_t isr_call_count = 0;
+
+/**
+ * @brief GPIO ISR handler for LSM6DSV16X INT1 pin
+ * 
+ * Captures timestamp and notifies data acquisition task
+ */
+static void IRAM_ATTR imu_isr_handler(void *arg) {
+  if (data_task_handle == NULL) {
+    return;
+  }
+  // Capture timestamp immediately for precise timing
+  interrupt_timestamp_us = esp_timer_get_time();
+  isr_call_count++;
+  // Notify data task to process FIFO
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(data_task_handle, &xHigherPriorityTaskWoken);
+  
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+/**
+ * @brief Millisecond delay function for LSM6DSV16X driver
+ *
+ * @param ms Delay in milliseconds
+ */
+static void platform_delay(uint32_t ms) {
+  vTaskDelay(pdMS_TO_TICKS(ms));
+}
 
 /**
  * @brief I²C write function for LSM6DSV16X driver
@@ -176,7 +213,7 @@ void app_main(void) {
   stmdev_ctx_t dev_ctx;
   dev_ctx.write_reg = platform_write;
   dev_ctx.read_reg = platform_read;
-  dev_ctx.mdelay = NULL; // Use vTaskDelay if needed
+  dev_ctx.mdelay = platform_delay;
   dev_ctx.handle = (void *)I2C_MASTER_NUM;
 
   // Try reading WHO_AM_I register with multiple attempts
@@ -218,14 +255,36 @@ void app_main(void) {
     return;
   }
 
+  // ========== Software Reset ==========
+  ESP_LOGI(TAG, "Performing software reset...");
+  err = lsm6dsv16x_sw_reset(&dev_ctx);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Software reset failed (error: %ld)", err);
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  // Enable Block Data Update (BDU) to ensure data integrity
+  err = lsm6dsv16x_block_data_update_set(&dev_ctx, 1);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to enable BDU (error: %ld)", err);
+    return;
+  }
+
   // ========== MILESTONE 2: Configure Sensor for 120 Hz HAODR Mode ==========
   ESP_LOGI(TAG, "");
-  ESP_LOGI(TAG, "Starting Milestone 2: Basic Sensor Reading");
+  ESP_LOGI(TAG, "Starting Milestone 2: Configure 120 Hz HAODR Mode");
 
   // Wait for device to be ready
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Configure accelerometer: 120 Hz HAODR, ±4g, high-performance mode
+  // Set accelerometer to High-Accuracy ODR (HAODR) mode first, then set ODR
+  err = lsm6dsv16x_xl_mode_set(&dev_ctx, LSM6DSV16X_XL_HIGH_ACCURACY_ODR_MD);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to set accelerometer HAODR mode (error: %ld)", err);
+    return;
+  }
+
   err = lsm6dsv16x_xl_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
   if (err != 0) {
     ESP_LOGE(TAG, "Failed to set accelerometer ODR (error: %ld)", err);
@@ -238,16 +297,16 @@ void app_main(void) {
     return;
   }
 
-  err = lsm6dsv16x_xl_mode_set(&dev_ctx, LSM6DSV16X_XL_HIGH_PERFORMANCE_MD);
+  ESP_LOGI(TAG,
+           "Accelerometer configured: 120 Hz HAODR, ±4g");
+
+  // Set gyroscope to High-Accuracy ODR (HAODR) mode first, then set ODR
+  err = lsm6dsv16x_gy_mode_set(&dev_ctx, LSM6DSV16X_GY_HIGH_ACCURACY_ODR_MD);
   if (err != 0) {
-    ESP_LOGE(TAG, "Failed to set accelerometer mode (error: %ld)", err);
+    ESP_LOGE(TAG, "Failed to set gyroscope HAODR mode (error: %ld)", err);
     return;
   }
 
-  ESP_LOGI(TAG,
-           "Accelerometer configured: 120 Hz HAODR, ±4g, high-performance");
-
-  // Configure gyroscope: 120 Hz HAODR, ±2000 dps, high-performance mode
   err = lsm6dsv16x_gy_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
   if (err != 0) {
     ESP_LOGE(TAG, "Failed to set gyroscope ODR (error: %ld)", err);
@@ -260,14 +319,8 @@ void app_main(void) {
     return;
   }
 
-  err = lsm6dsv16x_gy_mode_set(&dev_ctx, LSM6DSV16X_GY_HIGH_PERFORMANCE_MD);
-  if (err != 0) {
-    ESP_LOGE(TAG, "Failed to set gyroscope mode (error: %ld)", err);
-    return;
-  }
-
   ESP_LOGI(TAG,
-           "Gyroscope configured: 120 Hz HAODR, ±2000 dps, high-performance");
+           "Gyroscope configured: 120 Hz HAODR, ±2000 dps");
 
   // ========== MILESTONE 3: Enable SFLP for Quaternion Generation ==========
   ESP_LOGI(TAG, "");
@@ -296,176 +349,215 @@ void app_main(void) {
     return;
   }
 
-  // Enable accelerometer and gyroscope batching to FIFO
-  err = lsm6dsv16x_fifo_xl_batch_set(&dev_ctx, LSM6DSV16X_XL_BATCHED_AT_120Hz);
+  // Do NOT batch accel/gyro to FIFO — read them from output registers instead
+  err = lsm6dsv16x_fifo_xl_batch_set(&dev_ctx, LSM6DSV16X_XL_NOT_BATCHED);
   if (err != 0) {
-    ESP_LOGE(TAG, "Failed to enable accelerometer FIFO batching (error: %ld)", err);
+    ESP_LOGE(TAG, "Failed to disable accelerometer FIFO batching (error: %ld)", err);
     return;
   }
 
-  err = lsm6dsv16x_fifo_gy_batch_set(&dev_ctx, LSM6DSV16X_GY_BATCHED_AT_120Hz);
+  err = lsm6dsv16x_fifo_gy_batch_set(&dev_ctx, LSM6DSV16X_GY_NOT_BATCHED);
   if (err != 0) {
-    ESP_LOGE(TAG, "Failed to enable gyroscope FIFO batching (error: %ld)", err);
+    ESP_LOGE(TAG, "Failed to disable gyroscope FIFO batching (error: %ld)", err);
     return;
   }
 
-  // Set FIFO mode to continuous
+  // Set FIFO mode to continuous (stream) for SFLP quaternion data
   err = lsm6dsv16x_fifo_mode_set(&dev_ctx, LSM6DSV16X_STREAM_MODE);
   if (err != 0) {
     ESP_LOGE(TAG, "Failed to set FIFO mode (error: %ld)", err);
     return;
   }
 
-  // Set FIFO watermark (trigger when sufficient data available)
-  err = lsm6dsv16x_fifo_watermark_set(&dev_ctx, 10);
+  ESP_LOGI(TAG, "SFLP enabled: 120 Hz quaternion output via FIFO, accel/gyro via output registers");
+
+  // Enable interrupt generation with latched mode
+  lsm6dsv16x_interrupt_mode_t int_mode = {
+      .enable = 1,
+      .lir = 1,  // Latched: INT stays asserted until status is read
+  };
+  err = lsm6dsv16x_interrupt_enable_set(&dev_ctx, int_mode);
   if (err != 0) {
-    ESP_LOGE(TAG, "Failed to set FIFO watermark (error: %ld)", err);
+    ESP_LOGE(TAG, "Failed to enable interrupts (error: %ld)", err);
     return;
   }
 
-  ESP_LOGI(TAG, "SFLP enabled: 120 Hz quaternion output, FIFO configured");
+  // ========== MILESTONE 4: Configure GPIO Interrupt ==========
   ESP_LOGI(TAG, "");
-  ESP_LOGI(TAG, "Starting data acquisition (Ctrl+] to stop)...");
+  ESP_LOGI(TAG, "Starting Milestone 4: Interrupt-Driven Data Acquisition");
+
+  // Store task handle for ISR notification
+  data_task_handle = xTaskGetCurrentTaskHandle();
+
+  // Configure GPIO for INT1 interrupt
+  gpio_config_t io_conf = {
+      .intr_type = GPIO_INTR_POSEDGE,
+      .mode = GPIO_MODE_INPUT,
+      .pin_bit_mask = (1ULL << LSM6DSV16X_INT1_GPIO),
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+  };
+  ret = gpio_config(&io_conf);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure INT1 GPIO: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  // Install GPIO ISR service and add handler
+  ret = gpio_install_isr_service(0);
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  ret = gpio_isr_handler_add(LSM6DSV16X_INT1_GPIO, imu_isr_handler, NULL);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to add ISR handler: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  // Route gyroscope data-ready (DRDY) interrupt to INT1 pin
+  lsm6dsv16x_pin_int_route_t int1_route = {0};
+  int1_route.drdy_g = 1;  // Gyroscope data-ready on INT1
+  err = lsm6dsv16x_pin_int1_route_set(&dev_ctx, &int1_route);
+  if (err != 0) {
+    ESP_LOGE(TAG, "Failed to route DRDY_G interrupt to INT1 (error: %ld)", err);
+    return;
+  }
+
+  ESP_LOGI(TAG, "GPIO interrupt configured: INT1=GPIO%d, rising edge", LSM6DSV16X_INT1_GPIO);
+  ESP_LOGI(TAG, "Gyroscope DRDY interrupt routed to INT1");
+  ESP_LOGI(TAG, "");
+  ESP_LOGI(TAG, "Starting interrupt-driven data acquisition (Ctrl+] to stop)...");
   ESP_LOGI(TAG, "Format: [Sample] Timestamp(us) | Accel(mg): X, Y, Z | "
                 "Gyro(mdps): X, Y, Z | Euler(deg): Roll, Pitch, Yaw");
   ESP_LOGI(TAG, "");
 
-  // Data acquisition loop
+  // Data acquisition loop — interrupt-driven via gyroscope DRDY
   uint32_t sample_count = 0;
-  lsm6dsv16x_all_sources_t status;
-  lsm6dsv16x_fifo_out_raw_t fifo_data;
   int16_t accel_raw[3];
   int16_t gyro_raw[3];
   float accel_mg[3];
   float gyro_mdps[3];
-  float quat_raw[3]; // Quaternion x, y, z (w calculated from normalization)
   float quat_w, quat_x, quat_y, quat_z;
   float roll_deg, pitch_deg, yaw_deg;
-  bool have_accel = false;
-  bool have_gyro = false;
-  bool have_quat = false;
+
+  // Union for converting f16→f32 via lsm6dsv16x_from_f16_to_f32()
+  union {
+    uint32_t u;
+    float f;
+  } f16_conv;
 
   while (1) {
-    // Check FIFO status
-    err = lsm6dsv16x_all_sources_get(&dev_ctx, &status);
-    if (err != 0) {
-      ESP_LOGW(TAG, "Failed to read status (error: %ld)", err);
-      vTaskDelay(pdMS_TO_TICKS(10));
+    // Wait for gyroscope data-ready interrupt notification
+    uint32_t notification = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+
+    if (notification == 0) {
+      // Timeout — no interrupt received
       continue;
     }
 
-    // Process FIFO when watermark reached
-    if (status.fifo_th) {
-      // Capture timestamp for this batch
-      int64_t timestamp_us = esp_timer_get_time();
+    // Capture the ISR timestamp for this exact sample
+    int64_t sample_timestamp_us = interrupt_timestamp_us;
 
-      // Read FIFO entries
-      for (int i = 0; i < 50 && err == 0; i++) {
+    // Clear latched interrupt by reading ALL_INT_SRC register
+    lsm6dsv16x_all_sources_t all_src;
+    err = lsm6dsv16x_all_sources_get(&dev_ctx, &all_src);
+    if (err != 0) {
+      ESP_LOGW(TAG, "Failed to read interrupt sources (error: %ld)", err);
+      continue;
+    }
+
+    // ---- Read accelerometer from output registers ----
+    err = lsm6dsv16x_acceleration_raw_get(&dev_ctx, accel_raw);
+    if (err != 0) {
+      ESP_LOGW(TAG, "Failed to read accelerometer (error: %ld)", err);
+      continue;
+    }
+    accel_mg[0] = lsm6dsv16x_from_fs4_to_mg(accel_raw[0]);
+    accel_mg[1] = lsm6dsv16x_from_fs4_to_mg(accel_raw[1]);
+    accel_mg[2] = lsm6dsv16x_from_fs4_to_mg(accel_raw[2]);
+
+    // ---- Read gyroscope from output registers ----
+    err = lsm6dsv16x_angular_rate_raw_get(&dev_ctx, gyro_raw);
+    if (err != 0) {
+      ESP_LOGW(TAG, "Failed to read gyroscope (error: %ld)", err);
+      continue;
+    }
+    gyro_mdps[0] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[0]);
+    gyro_mdps[1] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[1]);
+    gyro_mdps[2] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[2]);
+
+    // ---- Read SFLP game rotation quaternion from FIFO ----
+    bool have_quat = false;
+    lsm6dsv16x_fifo_status_t fifo_status;
+    err = lsm6dsv16x_fifo_status_get(&dev_ctx, &fifo_status);
+    if (err == 0 && fifo_status.fifo_level > 0) {
+      // Drain FIFO entries, keeping the latest quaternion
+      for (uint16_t i = 0; i < fifo_status.fifo_level; i++) {
+        lsm6dsv16x_fifo_out_raw_t fifo_data;
         err = lsm6dsv16x_fifo_out_raw_get(&dev_ctx, &fifo_data);
         if (err != 0) {
           break;
         }
 
-        // Parse FIFO tag to identify data type
-        switch (fifo_data.tag) {
-        case LSM6DSV16X_XL_NC_TAG: // Accelerometer data
-          accel_raw[0] =
-              (int16_t)((fifo_data.data[1] << 8) | fifo_data.data[0]);
-          accel_raw[1] =
-              (int16_t)((fifo_data.data[3] << 8) | fifo_data.data[2]);
-          accel_raw[2] =
-              (int16_t)((fifo_data.data[5] << 8) | fifo_data.data[4]);
+        if (fifo_data.tag == LSM6DSV16X_SFLP_GAME_ROTATION_VECTOR_TAG) {
+          // SFLP game rotation: 3x half-precision floats (x, y, z)
+          uint16_t qh[3];
+          qh[0] = (uint16_t)((fifo_data.data[1] << 8) | fifo_data.data[0]);
+          qh[1] = (uint16_t)((fifo_data.data[3] << 8) | fifo_data.data[2]);
+          qh[2] = (uint16_t)((fifo_data.data[5] << 8) | fifo_data.data[4]);
 
-          accel_mg[0] = lsm6dsv16x_from_fs4_to_mg(accel_raw[0]);
-          accel_mg[1] = lsm6dsv16x_from_fs4_to_mg(accel_raw[1]);
-          accel_mg[2] = lsm6dsv16x_from_fs4_to_mg(accel_raw[2]);
-          have_accel = true;
-          break;
+          // Convert f16 → f32
+          f16_conv.u = lsm6dsv16x_from_f16_to_f32(qh[0]);
+          quat_x = f16_conv.f;
+          f16_conv.u = lsm6dsv16x_from_f16_to_f32(qh[1]);
+          quat_y = f16_conv.f;
+          f16_conv.u = lsm6dsv16x_from_f16_to_f32(qh[2]);
+          quat_z = f16_conv.f;
 
-        case LSM6DSV16X_GY_NC_TAG: // Gyroscope data
-          gyro_raw[0] =
-              (int16_t)((fifo_data.data[1] << 8) | fifo_data.data[0]);
-          gyro_raw[1] =
-              (int16_t)((fifo_data.data[3] << 8) | fifo_data.data[2]);
-          gyro_raw[2] =
-              (int16_t)((fifo_data.data[5] << 8) | fifo_data.data[4]);
-
-          gyro_mdps[0] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[0]);
-          gyro_mdps[1] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[1]);
-          gyro_mdps[2] = lsm6dsv16x_from_fs2000_to_mdps(gyro_raw[2]);
-          have_gyro = true;
-          break;
-
-        case LSM6DSV16X_SFLP_GAME_ROTATION_VECTOR_TAG: // Quaternion data
-          // SFLP quaternion is stored as 3x 16-bit values (x, y, z)
-          // Each value is in Q15 format (-1 to +1 normalized)
-          quat_raw[0] =
-              (int16_t)((fifo_data.data[1] << 8) | fifo_data.data[0]);
-          quat_raw[1] =
-              (int16_t)((fifo_data.data[3] << 8) | fifo_data.data[2]);
-          quat_raw[2] =
-              (int16_t)((fifo_data.data[5] << 8) | fifo_data.data[4]);
-
-          // Convert from Q15 format to float (-1.0 to +1.0)
-          quat_x = quat_raw[0] / 32768.0f;
-          quat_y = quat_raw[1] / 32768.0f;
-          quat_z = quat_raw[2] / 32768.0f;
-
-          // Calculate w from normalization constraint (w² + x² + y² + z² = 1)
-          float quat_sq_sum = quat_x * quat_x + quat_y * quat_y + quat_z * quat_z;
-          if (quat_sq_sum < 1.0f) {
-            quat_w = sqrtf(1.0f - quat_sq_sum);
-          } else {
-            quat_w = 0.0f; // Handle numerical errors
-          }
-
-          // Convert quaternion to Euler angles (in degrees)
-          // Roll (X-axis rotation)
-          float sinr_cosp = 2.0f * (quat_w * quat_x + quat_y * quat_z);
-          float cosr_cosp =
-              1.0f - 2.0f * (quat_x * quat_x + quat_y * quat_y);
-          roll_deg = atan2f(sinr_cosp, cosr_cosp) * 180.0f / M_PI;
-
-          // Pitch (Y-axis rotation)
-          float sinp = 2.0f * (quat_w * quat_y - quat_z * quat_x);
-          if (fabsf(sinp) >= 1.0f) {
-            pitch_deg =
-                copysignf(90.0f, sinp); // Use 90 degrees if out of range
-          } else {
-            pitch_deg = asinf(sinp) * 180.0f / M_PI;
-          }
-
-          // Yaw (Z-axis rotation)
-          float siny_cosp = 2.0f * (quat_w * quat_z + quat_x * quat_y);
-          float cosy_cosp =
-              1.0f - 2.0f * (quat_y * quat_y + quat_z * quat_z);
-          yaw_deg = atan2f(siny_cosp, cosy_cosp) * 180.0f / M_PI;
+          // Derive w from unit quaternion constraint: w²+x²+y²+z² = 1
+          float sq_sum = quat_x * quat_x + quat_y * quat_y + quat_z * quat_z;
+          quat_w = (sq_sum < 1.0f) ? sqrtf(1.0f - sq_sum) : 0.0f;
 
           have_quat = true;
-          break;
-
-        default:
-          // Unknown or unhandled FIFO tag
-          break;
-        }
-
-        // When we have all data types, print the combined output
-        if (have_accel && have_gyro && have_quat) {
-          printf("[%5lu] %lld | Accel: %7.2f, %7.2f, %7.2f | Gyro: %8.2f, "
-                 "%8.2f, %8.2f | Euler: %6.1f, %6.1f, %6.1f\n",
-                 sample_count, timestamp_us, accel_mg[0], accel_mg[1],
-                 accel_mg[2], gyro_mdps[0], gyro_mdps[1], gyro_mdps[2],
-                 roll_deg, pitch_deg, yaw_deg);
-
-          sample_count++;
-          have_accel = false;
-          have_gyro = false;
-          have_quat = false;
         }
       }
     }
 
-    // Small delay to prevent CPU hogging
-    vTaskDelay(pdMS_TO_TICKS(5));
+    if (!have_quat) {
+      // SFLP quaternion not yet available; skip this sample
+      continue;
+    }
+
+    // ---- Convert quaternion to Euler angles (degrees) ----
+    // Roll (X-axis rotation)
+    float sinr_cosp = 2.0f * (quat_w * quat_x + quat_y * quat_z);
+    float cosr_cosp = 1.0f - 2.0f * (quat_x * quat_x + quat_y * quat_y);
+    roll_deg = atan2f(sinr_cosp, cosr_cosp) * 180.0f / (float)M_PI;
+
+    // Pitch (Y-axis rotation)
+    float sinp = 2.0f * (quat_w * quat_y - quat_z * quat_x);
+    if (fabsf(sinp) >= 1.0f) {
+      pitch_deg = copysignf(90.0f, sinp);
+    } else {
+      pitch_deg = asinf(sinp) * 180.0f / (float)M_PI;
+    }
+
+    // Yaw (Z-axis rotation)
+    float siny_cosp = 2.0f * (quat_w * quat_z + quat_x * quat_y);
+    float cosy_cosp = 1.0f - 2.0f * (quat_y * quat_y + quat_z * quat_z);
+    yaw_deg = atan2f(siny_cosp, cosy_cosp) * 180.0f / (float)M_PI;
+
+    // ---- Print sample: counter, timestamp, accel, gyro, Euler ----
+    printf("[%5lu] %lld | Accel(mg): %7.2f, %7.2f, %7.2f | "
+           "Gyro(mdps): %8.2f, %8.2f, %8.2f | "
+           "Euler(deg): %6.1f, %6.1f, %6.1f\n",
+           sample_count, sample_timestamp_us,
+           accel_mg[0], accel_mg[1], accel_mg[2],
+           gyro_mdps[0], gyro_mdps[1], gyro_mdps[2],
+           roll_deg, pitch_deg, yaw_deg);
+
+    sample_count++;
   }
 }
